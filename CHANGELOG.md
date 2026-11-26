@@ -1,5 +1,14 @@
 # 更新日志
 
+## 1.2.0 (2026-11-26)
+
+- 抓取接口默认切换为微博 PC 网页版 `ajax/statuses/mymblog`，新增 `apiMode`（pc / auto / mobile）配置。
+- 支持播报**粉丝可见微博**：登录 Cookie 所属账号为博主粉丝时可拿到完整正文；非粉丝时识别占位卡片并跳过。
+- 支持播报**超话帖子**：识别 `region_name`，在播报标题标注来源超话。
+- 新增长微博全文展开（默认开启，`expandLongText` 可关闭）：移动端 `statuses/extend` 失败自动回退 PC 端 `statuses/longtext`。
+- 归一化 PC / 移动端两套字段（`text_raw` / `raw_text`、`pic_infos` / `pics`），图片下载兼容两种来源。
+- PC 接口请求携带 `x-xsrf-token`（从 Cookie 的 `XSRF-TOKEN` 提取），避免被判为未登录。
+
 ## 1.1.0 (2026-11-26)
 
 - npm 包更名为作用域包 `@sxedward/koishi-plugin-weibo-qq-broadcast`，GitHub 仓库迁移至 `sxedward/sxedward-koishi-plugin-weibo-qq-broadcast`。
