@@ -1,6 +1,6 @@
 {
   "name": "@sxedward/koishi-plugin-weibo-qq-broadcast",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "微博动态播报插件，适配 Koishi v4 的 QQ 官方机器人（qq / qqguild），支持控制台扫码登录自动获取 Cookie",
   "homepage": "https://github.com/sxedward/sxedward-koishi-plugin-weibo-qq-broadcast#readme",
   "repository": {
