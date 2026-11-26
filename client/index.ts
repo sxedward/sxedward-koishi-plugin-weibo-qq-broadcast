@@ -25,13 +25,15 @@ interface LoginPanelState {
   lastCheckedAt: number | null
   profile: WeiboProfile | null
   loginUrl: string
+  smsPhone: string | null
+  smsPending: boolean
 }
 
-const requestApi = async <T>(path: string, method = 'GET'): Promise<T> => {
+const requestApi = async <T>(path: string, method = 'GET', body?: Record<string, unknown>): Promise<T> => {
   const response = await fetch(`${API_PREFIX}${path}`, {
     method,
     headers: { 'content-type': 'application/json' },
-    body: method === 'GET' ? undefined : '{}',
+    body: method === 'GET' ? undefined : JSON.stringify(body ?? {}),
   })
   if (!response.ok) {
     const text = await response.text()
@@ -71,11 +73,16 @@ const styles = {
   danger: 'color: #cf222e;',
   warning: 'color: #9a6700;',
   error: 'color: #cf222e;',
+  smsBox: 'margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border, #d0d7de); display: grid; gap: 8px;',
+  smsTitle: 'font-size: 13px; font-weight: 700;',
+  smsRow: 'display: flex; gap: 8px; align-items: center; flex-wrap: wrap;',
+  input: 'appearance: none; border: 1px solid var(--border, #d0d7de); background: var(--bg, #fff); color: var(--fg1, #1f2328); padding: 7px 10px; border-radius: 8px; font-size: 13px; min-width: 180px;',
 }
 
 const useLoginState = () => {
   const state = ref<LoginPanelState | null>(null)
   const busy = ref(false)
+  const smsBusy = ref(false)
   const actionError = ref('')
   let timer: number | null = null
 
@@ -128,6 +135,49 @@ const useLoginState = () => {
     }
   }
 
+  interface SmsResult {
+    success: boolean
+    error?: string
+    message?: string
+    state?: LoginPanelState
+  }
+
+  const sendSms = async (phone: string) => {
+    smsBusy.value = true
+    actionError.value = ''
+    try {
+      const result = await requestApi<SmsResult>('/sms/send', 'POST', { phone })
+      if (!result.success) throw new Error(result.error || '验证码发送失败')
+      if (result.state) state.value = result.state
+      await refresh()
+      return true
+    } catch (error) {
+      captureError(error)
+      await refresh()
+      return false
+    } finally {
+      smsBusy.value = false
+    }
+  }
+
+  const loginWithSms = async (code: string) => {
+    smsBusy.value = true
+    actionError.value = ''
+    try {
+      const result = await requestApi<SmsResult>('/sms/login', 'POST', { code })
+      if (!result.success) throw new Error(result.error || '短信登录失败')
+      if (result.state) state.value = result.state
+      await refresh()
+      return true
+    } catch (error) {
+      captureError(error)
+      await refresh()
+      return false
+    } finally {
+      smsBusy.value = false
+    }
+  }
+
   onMounted(async () => {
     await refresh()
     timer = window.setInterval(() => {
@@ -139,7 +189,7 @@ const useLoginState = () => {
     if (timer !== null) window.clearInterval(timer)
   })
 
-  return { state, busy, actionError, refresh, startLogin, check, clear }
+  return { state, busy, smsBusy, actionError, refresh, startLogin, check, clear, sendSms, loginWithSms }
 }
 
 const LoginPanelCard = defineComponent({
@@ -148,7 +198,9 @@ const LoginPanelCard = defineComponent({
     embedded: Boolean,
   },
   setup(props) {
-    const { state, busy, actionError, refresh, startLogin, check, clear } = useLoginState()
+    const { state, busy, smsBusy, actionError, refresh, startLogin, check, clear, sendSms, loginWithSms } = useLoginState()
+    const phone = ref('')
+    const smsCode = ref('')
 
     return () => {
       const current = state.value
@@ -227,6 +279,47 @@ const LoginPanelCard = defineComponent({
             onClick: () => void clear(),
           }, '清除 Cookie'),
         ]),
+
+        // 短信验证码登录区
+        h('div', { style: styles.smsBox }, [
+          h('div', { style: styles.smsTitle }, '短信验证码登录'),
+          h('div', { style: 'font-size: 12px; color: var(--fg2, #57606a); line-height: 1.6;' },
+            '输入手机号获取验证码，登录成功后自动保存 Cookie。需要安装并启用 koishi-plugin-puppeteer。'),
+          h('div', { style: styles.smsRow }, [
+            h('input', {
+              style: styles.input,
+              type: 'tel',
+              placeholder: '手机号',
+              value: phone.value,
+              disabled: smsBusy.value,
+              onInput: (e: Event) => { phone.value = (e.target as HTMLInputElement).value },
+            }),
+            h('button', {
+              style: `${styles.button}${smsBusy.value || !phone.value ? ` ${styles.disabled}` : ''}`,
+              disabled: smsBusy.value || !phone.value,
+              onClick: () => void sendSms(phone.value),
+            }, smsBusy.value && !current?.smsPending ? '发送中…' : '获取验证码'),
+          ]),
+          current?.smsPending ? h('div', { style: styles.smsRow }, [
+            h('input', {
+              style: styles.input,
+              type: 'text',
+              placeholder: '短信验证码',
+              value: smsCode.value,
+              disabled: smsBusy.value,
+              onInput: (e: Event) => { smsCode.value = (e.target as HTMLInputElement).value },
+            }),
+            h('button', {
+              style: `${styles.button} ${styles.primary}${smsBusy.value || !smsCode.value ? ` ${styles.disabled}` : ''}`,
+              disabled: smsBusy.value || !smsCode.value,
+              onClick: () => void loginWithSms(smsCode.value),
+            }, smsBusy.value ? '登录中…' : '登录'),
+          ]) : null,
+          current?.smsPending
+            ? h('div', { style: 'font-size: 12px; color: var(--fg2, #57606a);' },
+              `已向 ${current.smsPhone || '手机号'} 发送验证码，请输入后点击「登录」。重新获取请再次点击「获取验证码」。`)
+            : null,
+        ]),
       ])
     }
   },
@@ -252,7 +345,7 @@ const LoginConfigPanel = defineComponent({
       extra: props.extra,
     }, {
       title: () => '微博 Cookie 登录',
-      desc: () => '扫码登录后自动保存 Cookie，并在下方显示有效性。Cookie 失效时会通知配置的群/频道与管理员。',
+      desc: () => '支持扫码登录与短信验证码登录，成功后自动保存 Cookie 并显示有效性。Cookie 失效时会通知配置的群/频道与管理员。',
       control: () => null,
       collapse: () => h('div', { style: 'margin-top: 12px;' }, [
         h(LoginPanelCard, { embedded: true }),
