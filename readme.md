@@ -25,9 +25,9 @@ GitHub 仓库：https://github.com/sxedward/sxedward-koishi-plugin-weibo-qq-broa
 - 同时支持 `qq` 与 `qqguild`，可为每个订阅单独指定平台和机器人 ID。
 - 默认使用微博 PC 网页版 ajax 接口，可播报**粉丝可见微博**和**超话帖子**；并会自动展开长微博全文。
 - 使用数据库保存每个订阅的最后一条微博 MID，重启后不会重复推送。
-- 支持文本、原微博链接、图片下载后发送。
+- 支持文本、原微博链接、图片下载后发送，并可附加**微博网页截图**（渲染作者、正文、超话来源与图片）。
 - 支持关键词白名单、屏蔽词黑名单、跳过转发微博。
-- 在 Koishi 控制台的插件配置页扫码登录微博，自动获取并保存 Cookie。
+- 在 Koishi 控制台的插件配置页登录微博，支持**扫码登录**和**短信验证码登录**，自动获取并保存 Cookie。
 - 控制台实时显示 Cookie 状态：未登录 / 有效 / 已失效 / 检测失败，并显示账号昵称、UID、上次检测与更新时间。
 - Cookie 失效时自动通知配置的群/频道，并可额外私聊通知管理员。
 - 首次运行默认只记录最新微博，不推送历史内容，可通过配置开启。
@@ -47,7 +47,7 @@ GitHub 仓库：https://github.com/sxedward/sxedward-koishi-plugin-weibo-qq-broa
    npm i koishi-plugin-database-sqlite
    ```
 
-3. 如需在控制台扫码登录，安装并启用 Puppeteer 服务：
+3. 如需使用扫码登录、短信登录或微博网页截图，安装并启用 Puppeteer 服务：
 
    ```bash
    npm i koishi-plugin-puppeteer
@@ -83,6 +83,31 @@ GitHub 仓库：https://github.com/sxedward/sxedward-koishi-plugin-weibo-qq-broa
 
 Cookie 状态判断使用 `https://m.weibo.cn/api/config`，以 `data.login === true` 且存在用户信息为有效依据。检测不到有效登录态时显示「已失效」。
 
+## 短信验证码登录
+
+在控制台登录面板的「短信验证码登录」区域：
+
+1. 输入手机号，点击「获取验证码」。
+2. 插件会通过 Puppeteer 打开微博登录页，切到短信登录、填入手机号并请求验证码。
+3. 收到短信后，在「短信验证码」输入框填入验证码，点击「登录」。
+4. 登录成功后 Cookie 自动保存到数据库，面板显示当前账号昵称。
+
+注意事项：
+
+- 需要安装并启用 `koishi-plugin-puppeteer`。
+- 短信登录会话只保存在内存中，默认 10 分钟内有效；超时需重新获取验证码。重新点击「获取验证码」会开启新会话。
+- 未注册手机号验证通过后会由微博自动注册，请以微博平台实际规则为准。
+- 手机号登录同样受微博风控影响；若请求频繁被拦截，可改用扫码登录。
+
+## 微博网页截图
+
+开启 `screenshot: true`（或在单个订阅里单独开启）后，每条播报会额外附带一张渲染好的微博卡片截图，包含作者、正文全文、超话来源、转发内容和图片。
+
+- 截图由插件本地渲染 HTML 后生成，不依赖微博页面登录态，也不受微博风控影响。
+- 需要安装并启用 `koishi-plugin-puppeteer`；未安装时会自动跳过截图，不影响文字和图片播报。
+- `screenshotWidth` 控制截图宽度（默认 720 像素），高度按内容自适应。
+- 截图与原图可能同时发送；若只想保留截图，可把 `sendImages` 设为 `false`。
+
 ## 超话帖子与粉丝可见微博
 
 插件默认使用微博 PC 网页版的 `ajax/statuses/mymblog` 接口抓取（配置项 `apiMode: pc`）。相比旧的移动端接口，它能拿到受限博主的完整内容，是播报这两类微博的关键：
@@ -91,7 +116,7 @@ Cookie 状态判断使用 `https://m.weibo.cn/api/config`，以 `data.login === 
 - **粉丝可见微博**：前提条件是**扫码登录的微博账号必须是该博主的粉丝**。满足此条件时，PC 接口会返回完整正文并正常播报。若登录账号不是粉丝，微博只会返回「因用户隐私设置你看不到」的占位内容，插件会识别并跳过，不会播报错乱提示。
 - **长文本展开**：时间线接口给的 `text` 会被截断，插件默认按 MID 调用全文接口补全正文（移动端 `statuses/extend` 失败会自动回退到 PC 端 `statuses/longtext`）。可通过 `expandLongText: false` 关闭。
 
-如果没有扫码登录（或只手动填了不完整的 Cookie），PC 接口会返回 `ok=-100`，此时不会有任何播报。建议始终使用控制台扫码登录，保证 Cookie 完整且包含 `XSRF-TOKEN`。
+如果没有通过控制台登录（或只手动填了不完整的 Cookie），PC 接口会返回 `ok=-100`，此时不会有任何播报。建议使用控制台扫码登录或短信登录，保证 Cookie 完整且包含 `XSRF-TOKEN`。
 
 接口可用 `apiMode` 切换：
 
@@ -112,6 +137,8 @@ plugins:
     updateInterval: 5
     apiMode: pc
     expandLongText: true
+    screenshot: false
+    screenshotWidth: 720
     cookieCheckInterval: 30
     expiryNotify: true
     expiryNotifyChannels: []
@@ -147,6 +174,8 @@ plugins:
 | `updateInterval` | 轮询间隔，单位分钟，范围 1 到 1440。 |
 | `apiMode` | 抓取接口：`pc`（默认，支持粉丝可见/超话长文，需登录）、`auto`（PC 失败回退移动端）、`mobile`（旧移动端接口）。 |
 | `expandLongText` | 是否自动展开长微博全文，默认开启。 |
+| `screenshot` | 播报时是否附加微博网页截图，默认关闭；需 Puppeteer。 |
+| `screenshotWidth` | 网页截图宽度（像素），默认 720，高度自适应。 |
 | `cookieCheckInterval` | Cookie 有效性检查间隔，单位分钟。 |
 | `expiryNotify` | Cookie 失效时是否发送通知。 |
 | `expiryNotifyChannels` | 失效通知目标。留空则通知所有订阅的群/频道。 |
