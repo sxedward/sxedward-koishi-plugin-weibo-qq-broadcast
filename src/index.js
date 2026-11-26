@@ -24,6 +24,11 @@ const API_PREFIX = '/weibo-qq-broadcast/api'
 const LOGIN_URL = 'https://passport.weibo.com/'
 const WEIBO_CONFIG_API = 'https://m.weibo.cn/api/config'
 const WEIBO_CONTAINER_API = 'https://m.weibo.cn/api/container/getIndex'
+// PC 端 ajax 接口：带完整 Cookie 才能看到「仅粉丝可见」等受限微博，字段也更全（text_raw / pic_infos / region_name）
+const WEIBO_PC_API = 'https://www.weibo.com/ajax/statuses/mymblog'
+// 长文本展开接口：时间线里的 text 会被截断，需按 mid 拉取完整正文
+const WEIBO_EXTEND_API = 'https://m.weibo.cn/statuses/extend'
+const WEIBO_LONGTEXT_API = 'https://www.weibo.com/ajax/statuses/longtext'
 const COOKIE_TABLE = 'weibo_qq_broadcast_cookie'
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -56,6 +61,14 @@ const ConfigBody = Schema.object({
     .max(1440)
     .default(5)
     .description('轮询间隔，单位：分钟。'),
+
+  apiMode: Schema.union(['pc', 'mobile', 'auto'])
+    .default('pc')
+    .description('微博接口：pc = PC 网页 ajax 接口（推荐，需登录 Cookie，可播报粉丝可见微博与超话长文）；mobile = 旧移动端接口；auto = 先 PC 失败再回退移动端。'),
+
+  expandLongText: Schema.boolean()
+    .default(true)
+    .description('自动展开长微博全文（超话长文常见）。关闭则只播报时间线里的截断文本。'),
 
   cookieCheckInterval: Schema.number()
     .min(1)
@@ -174,15 +187,171 @@ function getCookie(config, state) {
   return String(config.cookie || '').trim() || String(state.cookie || '').trim()
 }
 
-function buildHeaders(config, state, referer) {
+function extractXsrfToken(payload) {
+  if (!payload) return ''
+  if (Array.isArray(payload)) {
+    const token = payload.find((item) => item?.name === 'XSRF-TOKEN' || item?.name === 'XSRF')
+    return String(token?.value || '')
+  }
+  const match = String(payload).match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/i)
+  return match ? decodeURIComponent(match[1]) : ''
+}
+
+function buildHeaders(config, state, referer, options = {}) {
   const headers = {
     Accept: 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
     Referer: referer || 'https://m.weibo.cn/',
     'User-Agent': UA,
   }
+  if (options.mobile) headers['mweibo-pwa'] = '1'
+  if (options.xhr) headers['X-Requested-With'] = 'XMLHttpRequest'
+
   const cookie = getCookie(config, state)
-  if (cookie) headers.Cookie = cookie
+  if (cookie) {
+    headers.Cookie = cookie
+    // PC ajax 接口要求 XSRF token，否则可能被判为未登录（ok=-100）
+    // 扫码保存的 cookie 对象里带 XSRF-TOKEN；手动填写的整串 Cookie 里也可能含它
+    const xsrf = extractXsrfToken(options.mobile || options.xhr ? state.cookies : null) || extractXsrfToken(cookie)
+    if (xsrf) headers['x-xsrf-token'] = xsrf
+  }
   return headers
+}
+
+// 把 PC / 移动端两套字段归一化到统一结构，方便后续处理
+function normalizePost(raw, source) {
+  if (!raw || typeof raw !== 'object') return null
+  const mid = getMid(raw)
+  if (!mid) return null
+
+  const user = raw.user || {}
+  const regionName = String(raw.region_name || raw.regionName || '').trim()
+  // PC 用 text_raw，移动端用 raw_text；两者都缺失时再退回 HTML 的 text
+  const fullText = String(source === 'pc'
+    ? (raw.text_raw ?? raw.text ?? '')
+    : (raw.raw_text ?? raw.text ?? ''))
+  const text = fullText.trim() || stripHtml(raw.text ?? '')
+  const isLong = raw.isLongText === true || raw.isLongText === 1 || /全文|展开/.test(String(raw.text || ''))
+
+  return {
+    mid,
+    source,
+    raw,
+    user,
+    author: String(user.screen_name || user.name || '微博用户').trim(),
+    text,
+    isLong,
+    regionName,
+    visible: raw.visible || null,
+    createdAt: String(raw.created_at || ''),
+    retweeted: raw.retweeted_status ? normalizePost(raw.retweeted_status, source) : null,
+    picIds: Array.isArray(raw.pic_ids) ? raw.pic_ids.map(String) : [],
+    picInfos: raw.pic_infos || {},
+    pics: Array.isArray(raw.pics) ? raw.pics : [],
+  }
+}
+
+// m.weibo.cn 时间线在未登录/非粉丝时，会把受限微博替换成占位卡片，必须过滤掉
+function isPlaceholderPost(post) {
+  if (!post) return true
+  const text = String(post.text || '')
+  const user = post.user || {}
+  const hasAuthor = Boolean(user.id ?? user.idstr ?? user.screen_name)
+  if (!post.picIds.length && !post.pics.length && !Object.keys(post.picInfos).length && !hasAuthor) return true
+  // 只匹配微博系统生成的完整提示句式，避免把正文里提到「粉丝可见」的正常微博误判为占位
+  return [
+    '因用户隐私设置，你看不到这条微博',
+    '由于用户隐私设置，你看不到这条微博',
+    '你当前无法查看这条微博',
+    '该微博因用户设置为仅粉丝可见',
+    '这条微博仅粉丝可见',
+    '该微博已被作者删除',
+    '很抱歉，你看不到这条微博',
+  ].some((marker) => text.includes(marker))
+}
+
+async function expandLongText(ctx, config, state, post) {
+  if (!config.expandLongText || !post.isLong) return post.text
+
+  // 先试移动端 extend，再试 PC longtext；两者取先成功的完整正文
+  const attempts = [
+    {
+      url: WEIBO_EXTEND_API,
+      headers: buildHeaders(config, state, `https://m.weibo.cn/status/${post.mid}`, { mobile: true, xhr: true }),
+      pick: (payload) => payload?.data?.longTextContent,
+    },
+    {
+      url: WEIBO_LONGTEXT_API,
+      headers: buildHeaders(config, state, `https://weibo.com/${post.user?.id ?? ''}/${post.mid}`, { xhr: true }),
+      pick: (payload) => payload?.data?.longTextContent || payload?.longTextContent,
+    },
+  ]
+
+  for (const attempt of attempts) {
+    try {
+      const response = await ctx.http(attempt.url, {
+        method: 'GET',
+        params: { id: post.mid },
+        headers: attempt.headers,
+        responseType: 'json',
+        timeout: 15000,
+      })
+      const payload = parseLooseJson(response.data)
+      const html = attempt.pick(payload)
+      if (html) {
+        const expanded = stripHtml(html)
+        if (expanded) return expanded
+      }
+    } catch (error) {
+      if (config.debug) logger.info(`展开长文本失败（${post.mid}，${attempt.url}）：${error.message}`)
+    }
+  }
+  return post.text
+}
+
+async function fetchPcPosts(ctx, config, state, uid) {
+  if (!getCookie(config, state)) {
+    throw new Error('PC 接口需要登录 Cookie，请先在插件配置页扫码登录')
+  }
+  const response = await ctx.http(WEIBO_PC_API, {
+    method: 'GET',
+    params: { uid, page: 1, feature: 0 },
+    headers: buildHeaders(config, state, `https://weibo.com/u/${uid}`, { xhr: true }),
+    responseType: 'json',
+    timeout: 20000,
+  })
+  const payload = parseLooseJson(response.data)
+  if (payload.ok !== 1) {
+    throw new Error(`PC 微博接口返回异常：ok=${payload.ok ?? 'unknown'}${payload.msg ? ` msg=${payload.msg}` : ''}`)
+  }
+  const list = payload.data?.list
+  if (!Array.isArray(list)) return []
+  return list.map((item) => normalizePost(item, 'pc')).filter(Boolean)
+}
+
+async function fetchMobilePosts(ctx, config, state, uid) {
+  const response = await ctx.http(WEIBO_CONTAINER_API, {
+    method: 'GET',
+    params: {
+      type: 'uid',
+      value: uid,
+      containerid: `107603${uid}`,
+    },
+    headers: buildHeaders(config, state, `https://weibo.com/u/${uid}`, { mobile: true, xhr: true }),
+    responseType: 'json',
+    timeout: 20000,
+  })
+
+  const payload = parseLooseJson(response.data)
+  if (payload.ok !== 1) {
+    throw new Error(`微博接口返回异常：ok=${payload.ok ?? 'unknown'}`)
+  }
+
+  const cards = payload.data?.cards
+  if (!Array.isArray(cards)) return []
+  return cards
+    .map((card) => normalizePost(card?.mblog, 'mobile'))
+    .filter(Boolean)
 }
 
 function parseLooseJson(payload) {
@@ -232,26 +401,35 @@ function getMid(post) {
 }
 
 function isPinned(post) {
-  return Number(post?.is_top ?? 0) === 1 || Boolean(post?.isTop)
+  const source = post?.raw || post || {}
+  return Number(source.is_top ?? 0) === 1 || Boolean(source.isTop)
 }
 
 function getPostText(post) {
   if (!post) return ''
-  return String(post.raw_text ?? '').trim() || stripHtml(post.text ?? '')
+  // 归一化后的对象用 text（已是全文）；原始对象仍兼容 raw_text / text
+  if (post.text != null && post.raw != null) return String(post.text || '').trim()
+  return String(post.raw_text ?? post.text_raw ?? '').trim() || stripHtml(post.text ?? '')
+}
+
+function getRetweeted(post) {
+  return post?.retweeted || post?.retweeted_status || null
 }
 
 function getSearchText(post) {
   if (!post) return ''
   const parts = [getPostText(post)]
-  if (post.retweeted_status) {
-    parts.push(getPostText(post.retweeted_status))
-    parts.push(String(post.retweeted_status.user?.screen_name ?? ''))
+  const retweeted = getRetweeted(post)
+  if (retweeted) {
+    parts.push(getPostText(retweeted))
+    parts.push(String(retweeted.author || retweeted.user?.screen_name || ''))
   }
+  if (post.regionName) parts.push(post.regionName)
   return parts.filter(Boolean).join('\n')
 }
 
 function matchesFilters(sub, post) {
-  if (sub.skipForward && post.retweeted_status) return false
+  if (sub.skipForward && getRetweeted(post)) return false
 
   const text = getSearchText(post)
   const blockwords = (sub.blockwords || []).map((word) => String(word).trim()).filter(Boolean)
@@ -275,20 +453,35 @@ function normalizeUrl(rawUrl) {
 }
 
 function getImageUrls(post) {
-  const pics = Array.isArray(post?.pics) ? post.pics : []
   const result = []
 
-  if (Array.isArray(post?.pic_ids) && post.pic_ids.length) {
-    for (const pid of post.pic_ids) {
-      const pic = pics.find((item) => String(item?.pid ?? item?.id) === String(pid))
-        || pics[result.length]
-      const url = normalizeUrl(pic?.large?.url || pic?.url || pic?.thumbnail)
+  // PC 接口：pic_infos 是以 pic_id 为键的对象，pic_ids 决定顺序
+  const picInfos = post?.picInfos || post?.pic_infos || {}
+  const picIds = post?.picIds || (Array.isArray(post?.pic_ids) ? post.pic_ids.map(String) : [])
+  if (Object.keys(picInfos).length) {
+    const ids = picIds.length ? picIds : Object.keys(picInfos)
+    for (const pid of ids) {
+      const info = picInfos[pid] || {}
+      const url = normalizeUrl(info?.large?.url || info?.url || info?.thumbnail)
       if (url) result.push(url)
     }
-  } else {
-    for (const pic of pics) {
-      const url = normalizeUrl(pic?.large?.url || pic?.url || pic?.thumbnail)
-      if (url) result.push(url)
+  }
+
+  // 移动端接口：pics 数组
+  const pics = Array.isArray(post?.pics) ? post.pics : []
+  if (!result.length) {
+    if (Array.isArray(post?.pic_ids) && post.pic_ids.length) {
+      for (const pid of post.pic_ids) {
+        const pic = pics.find((item) => String(item?.pid ?? item?.id) === String(pid))
+          || pics[result.length]
+        const url = normalizeUrl(pic?.large?.url || pic?.url || pic?.thumbnail)
+        if (url) result.push(url)
+      }
+    } else {
+      for (const pic of pics) {
+        const url = normalizeUrl(pic?.large?.url || pic?.url || pic?.thumbnail)
+        if (url) result.push(url)
+      }
     }
   }
 
@@ -296,29 +489,41 @@ function getImageUrls(post) {
 }
 
 async function fetchPosts(ctx, config, state, uid) {
-  const response = await ctx.http(WEIBO_CONTAINER_API, {
-    method: 'GET',
-    params: {
-      type: 'uid',
-      value: uid,
-      containerid: `107603${uid}`,
-    },
-    headers: buildHeaders(config, state, `https://weibo.com/u/${uid}`),
-    responseType: 'json',
-    timeout: 20000,
-  })
+  const mode = config.apiMode || 'pc'
+  const usePc = mode === 'pc' || mode === 'auto'
 
-  const payload = parseLooseJson(response.data)
-  if (payload.ok !== 1) {
-    throw new Error(`微博接口返回异常：ok=${payload.ok ?? 'unknown'}`)
+  let posts = []
+  let pcError = null
+  if (usePc) {
+    try {
+      posts = await fetchPcPosts(ctx, config, state, uid)
+    } catch (error) {
+      pcError = error
+      if (mode === 'pc') throw error
+      if (config.debug) logger.info(`PC 接口失败，回退移动端：${error.message}`)
+    }
   }
 
-  const cards = payload.data?.cards
-  if (!Array.isArray(cards)) return []
+  if (!usePc || (mode === 'auto' && (pcError || !posts.length))) {
+    try {
+      posts = await fetchMobilePosts(ctx, config, state, uid)
+    } catch (error) {
+      if (pcError) throw pcError
+      throw error
+    }
+  }
 
-  return cards
-    .map((card) => card?.mblog)
-    .filter((post) => post && typeof post === 'object')
+  const result = []
+  for (const post of posts) {
+    if (isPlaceholderPost(post)) {
+      if (config.debug) logger.info(`跳过受限/占位微博：${post.mid}（${post.text.slice(0, 30)}）`)
+      continue
+    }
+    post.text = await expandLongText(ctx, config, state, post)
+    if (post.retweeted) post.retweeted.text = await expandLongText(ctx, config, state, post.retweeted)
+    result.push(post)
+  }
+  return result
 }
 
 function subscriptionKey(sub) {
@@ -337,15 +542,18 @@ async function saveState(ctx, key, post) {
 }
 
 function formatPost(config, sub, post) {
-  const author = String(post.user?.screen_name || post.user?.name || '微博用户').trim()
+  const author = post.author || String(post.user?.screen_name || post.user?.name || '微博用户').trim()
   const text = getPostText(post)
   const showLink = sub.showLink ?? config.showLink ?? true
 
-  let content = `${author} 发布了微博：\n${text}`.trim()
+  // 超话帖子在标题上标注来源超话，便于区分普通微博
+  const topic = post.regionName ? `\n超话：#${post.regionName}#` : ''
+  let content = `${author} 发布了微博：${topic}\n${text}`.trim()
 
-  if (post.retweeted_status) {
-    const rtAuthor = String(post.retweeted_status.user?.screen_name || '微博用户').trim()
-    const rtText = getPostText(post.retweeted_status)
+  const retweeted = getRetweeted(post)
+  if (retweeted) {
+    const rtAuthor = retweeted.author || String(retweeted.user?.screen_name || '微博用户').trim()
+    const rtText = getPostText(retweeted)
     if (rtText) content += `\n\n转发 ${rtAuthor}：\n${rtText}`
   }
 
