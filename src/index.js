@@ -70,6 +70,16 @@ const ConfigBody = Schema.object({
     .default(true)
     .description('自动展开长微博全文（超话长文常见）。关闭则只播报时间线里的截断文本。'),
 
+  screenshot: Schema.boolean()
+    .default(false)
+    .description('播报时附加微博网页截图（需 koishi-plugin-puppeteer）。截图会渲染作者、正文、超话来源与图片。'),
+
+  screenshotWidth: Schema.number()
+    .min(400)
+    .max(1200)
+    .default(720)
+    .description('网页截图宽度（像素），高度按内容自适应。'),
+
   cookieCheckInterval: Schema.number()
     .min(1)
     .max(1440)
@@ -175,6 +185,10 @@ const ConfigBody = Schema.object({
     mentionAll: Schema.boolean()
       .default(false)
       .description('覆盖全局：是否 @全体成员。'),
+
+    screenshot: Schema.boolean()
+      .default(false)
+      .description('覆盖全局：该订阅播报时是否附加网页截图（需 Puppeteer）。'),
   }).description('订阅项')).role('table').description('微博订阅列表'),
 }).description('播报设置')
 
@@ -565,6 +579,105 @@ function formatPost(config, sub, post) {
   return content
 }
 
+function escapeHtml(input) {
+  return String(input ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+// 把正文里的纯文本换行转成 <br>；链接转成可点击锚点（截图里只是视觉呈现）
+function textToHtml(text) {
+  return escapeHtml(text)
+    .replace(/(https?:\/\/[^\s<]+)/g, '<span class="link">$1</span>')
+    .replace(/\n/g, '<br>')
+}
+
+function buildPostHtml(post, images) {
+  const author = escapeHtml(post.author || post.user?.screen_name || '微博用户')
+  const text = textToHtml(getPostText(post))
+  const region = post.regionName ? `<div class="region"># ${escapeHtml(post.regionName)}</div>` : ''
+  const retweeted = getRetweeted(post)
+  let retweetHtml = ''
+  if (retweeted) {
+    const rtAuthor = escapeHtml(retweeted.author || retweeted.user?.screen_name || '微博用户')
+    const rtText = textToHtml(getPostText(retweeted))
+    retweetHtml = `<div class="retweet"><div class="rt-author">转发 ${rtAuthor}</div><div class="body">${rtText}</div></div>`
+  }
+  const imageHtml = images.length
+    ? `<div class="images">${images.map((src) => `<img src="${escapeHtml(src)}">`).join('')}</div>`
+    : ''
+  const footer = `<div class="footer">微博 · ${escapeHtml(getMid(post))}</div>`
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; background: #f2f3f5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; color: #1a1a1a; }
+    .card { width: 100%; background: #fff; border-radius: 18px; padding: 24px 26px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); }
+    .head { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
+    .avatar { width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg, #ffb3c1, #ff8200); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: 700; flex: none; }
+    .name { font-size: 17px; font-weight: 700; }
+    .sub { font-size: 12px; color: #939393; margin-top: 2px; }
+    .region { display: inline-block; background: #fff3e6; color: #ff8200; border-radius: 6px; padding: 3px 10px; font-size: 13px; font-weight: 600; margin-bottom: 12px; }
+    .body { font-size: 16px; line-height: 1.75; word-break: break-word; white-space: normal; }
+    .link { color: #eb5908; }
+    .retweet { margin-top: 14px; background: #f7f7f7; border-radius: 10px; padding: 14px 16px; }
+    .rt-author { font-size: 14px; color: #57606a; margin-bottom: 6px; }
+    .retweet .body { font-size: 15px; }
+    .images { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 16px; }
+    .images img { width: 100%; height: 220px; object-fit: cover; border-radius: 8px; background: #eee; }
+    .footer { margin-top: 18px; padding-top: 12px; border-top: 1px solid #eee; font-size: 12px; color: #b0b0b0; }
+  </style></head><body><div class="card">
+    <div class="head"><div class="avatar">${author.slice(0, 1)}</div><div><div class="name">${author}</div><div class="sub">微博用户</div></div></div>
+    ${region}
+    <div class="body">${text}</div>
+    ${retweetHtml}
+    ${imageHtml}
+    ${footer}
+  </div></body></html>`
+}
+
+async function renderPostScreenshot(ctx, config, state, sub, post) {
+  if (!ctx.puppeteer?.page) return null
+  if (!ctx.puppeteer.browser && typeof ctx.puppeteer.start === 'function') {
+    await ctx.puppeteer.start()
+  }
+
+  const maxImages = Number(sub.maxImages ?? config.maxImages ?? 4)
+  const urls = getImageUrls(post).slice(0, Math.max(0, Math.min(maxImages, 4)))
+  const dataUrls = []
+  for (const url of urls) {
+    try {
+      const response = await ctx.http(url, {
+        method: 'GET',
+        responseType: 'arraybuffer',
+        headers: buildHeaders(config, state, 'https://weibo.com/'),
+        timeout: 20000,
+      })
+      const bytes = response.data
+      const length = bytes?.byteLength ?? bytes?.length ?? 0
+      if (!length || length > 10 * 1024 * 1024) continue
+      const contentType = response.headers.get('content-type') || 'image/jpeg'
+      const mime = contentType.startsWith('image/') ? contentType.split(';')[0] : 'image/jpeg'
+      dataUrls.push(`data:${mime};base64,${Buffer.from(bytes).toString('base64')}`)
+    } catch {}
+  }
+
+  const page = await ctx.puppeteer.page()
+  try {
+    await page.setViewport({ width: Number(config.screenshotWidth || 720), height: 1200, deviceScaleFactor: 1 })
+    await page.setContent(buildPostHtml(post, dataUrls), { waitUntil: 'domcontentloaded', timeout: 30000 })
+    const buffer = await page.screenshot({ type: 'png', fullPage: true })
+    return buffer
+  } catch (error) {
+    logger.warn(`生成微博截图失败：${error.message}`)
+    return null
+  } finally {
+    await page.close().catch(() => {})
+  }
+}
+
 async function buildElements(ctx, config, state, sub, post, channelId) {
   const bot = resolveBot(ctx, config, sub, channelId)
   const elements = []
@@ -576,6 +689,12 @@ async function buildElements(ctx, config, state, sub, post, channelId) {
   }
 
   elements.push(h.text(formatPost(config, sub, post)))
+
+  const wantScreenshot = sub.screenshot ?? config.screenshot ?? false
+  if (wantScreenshot) {
+    const image = await renderPostScreenshot(ctx, config, state, sub, post)
+    if (image) elements.push(h.image(image, 'image/png'))
+  }
 
   const sendImages = sub.sendImages ?? config.sendImages ?? true
   if (sendImages) {
@@ -1003,6 +1122,8 @@ function getLoginPanelState(ctx, config, state) {
     lastCheckedAt: state.lastCheckedAt,
     profile: state.profile,
     loginUrl: LOGIN_URL,
+    smsPhone: state.smsSession?.phone || null,
+    smsPending: Boolean(state.smsSession?.codeSent),
   }
 }
 
@@ -1086,6 +1207,174 @@ async function startLogin(ctx, config, state, force = false) {
   return task
 }
 
+/* ------------------------------ 短信验证码登录 ------------------------------ */
+
+// 在 SPA 里点击文字匹配的 tab / 按钮，带多组关键词兜底
+async function clickByText(page, texts, tags = ['a', 'button', 'span', 'div', 'li']) {
+  return await page.evaluate((textList, tagList) => {
+    const targets = Array.from(document.querySelectorAll(tagList.join(',')))
+    for (const text of textList) {
+      for (const el of targets) {
+        const label = (el.innerText || el.textContent || '').trim()
+        if (label === text || label.includes(text)) {
+          el.click()
+          return true
+        }
+      }
+    }
+    return false
+  }, texts, tags)
+}
+
+async function clickAgreementIfNeeded(page) {
+  return await page.evaluate(() => {
+    const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]'))
+    for (const box of boxes) {
+      if (!box.checked) {
+        box.click()
+        return true
+      }
+    }
+    return false
+  })
+}
+
+async function findInput(page, labels) {
+  for (const label of labels) {
+    const el = await page.$(`input[aria-label="${label}"]`) || await page.$(`input[placeholder="${label}"]`)
+    if (el) return el
+  }
+  return null
+}
+
+function closeSmsSession(state) {
+  const session = state.smsSession
+  state.smsSession = null
+  if (session?.page) session.page.close().catch(() => {})
+}
+
+// 第一步：打开登录页，切到短信登录，填手机号并请求验证码
+async function startSmsLogin(ctx, config, state, phone) {
+  if (!ctx.puppeteer?.page) throw new Error('未检测到可用的 Puppeteer 服务，无法使用短信登录')
+  if (!ctx.puppeteer.browser && typeof ctx.puppeteer.start === 'function') {
+    await ctx.puppeteer.start()
+  }
+
+  const normalizedPhone = String(phone || '').replace(/[\s-]/g, '')
+  if (!/^\d{6,15}$/.test(normalizedPhone)) throw new Error('请输入正确的手机号')
+
+  closeSmsSession(state)
+  const page = await ctx.puppeteer.page()
+  state.smsSession = { page, phone: normalizedPhone, createdAt: Date.now(), codeSent: false }
+
+  try {
+    await page.goto(LOGIN_URL, { waitUntil: 'networkidle2', timeout: 120000 })
+    // 等待 SPA 渲染
+    let phoneInput = null
+    for (let i = 0; i < 20; i++) {
+      phoneInput = await findInput(page, ['手机号', '手机号码', 'phone'])
+      if (phoneInput) break
+      await wait(500)
+    }
+    if (!phoneInput) throw new Error('未找到手机号输入框，登录页结构可能已变化')
+
+    // 切到短信登录 tab（默认可能已是短信登录）
+    await clickByText(page, ['短信验证登录', '验证码登录', '短信登录'])
+
+    await page.evaluate((el) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      setter?.call(el, '')
+      el.dispatchEvent(new Event('input', { bubbles: true }))
+    }, phoneInput)
+    await phoneInput.click({ clickCount: 3 })
+    await phoneInput.type(normalizedPhone, { delay: 30 })
+
+    await clickAgreementIfNeeded(page)
+
+    const clicked = await clickByText(page, ['获取验证码', '发送验证码'])
+    if (!clicked) throw new Error('未找到「获取验证码」按钮')
+
+    await wait(1500)
+    state.smsSession.codeSent = true
+    state.loginState = 'sms-pending'
+    state.loginMessage = `验证码已发送到 ${normalizedPhone.slice(0, 3)}****${normalizedPhone.slice(-4)}，请在下方输入`
+    logger.info(`微博短信验证码已请求：${normalizedPhone.slice(0, 3)}****${normalizedPhone.slice(-4)}`)
+    return { sent: true, message: state.loginMessage, phone: normalizedPhone }
+  } catch (error) {
+    closeSmsSession(state)
+    state.loginState = 'error'
+    state.loginMessage = '短信验证码请求失败'
+    state.lastError = error.message || String(error)
+    throw error
+  }
+}
+
+// 第二步：填入验证码并完成登录，成功后保存 Cookie
+async function completeSmsLogin(ctx, config, state, code) {
+  const session = state.smsSession
+  if (!session?.page) throw new Error('当前没有待验证的短信登录会话，请先输入手机号获取验证码')
+  if (!session.codeSent) throw new Error('验证码尚未发送，请先获取验证码')
+  if (Date.now() - session.createdAt > 10 * 60 * 1000) {
+    closeSmsSession(state)
+    throw new Error('短信登录会话已超时，请重新获取验证码')
+  }
+
+  const normalizedCode = String(code || '').replace(/\s/g, '')
+  if (!/^\d{4,8}$/.test(normalizedCode)) throw new Error('请输入正确的短信验证码')
+
+  const page = session.page
+  try {
+    if (!(await isLoggedIn(page))) {
+      const codeInput = await findInput(page, ['验证码', 'scode'])
+      if (!codeInput) throw new Error('未找到验证码输入框，登录页结构可能已变化')
+      await codeInput.click({ clickCount: 3 })
+      await codeInput.type(normalizedCode, { delay: 40 })
+
+      await clickAgreementIfNeeded(page)
+      const clicked = await clickByText(page, ['登录/注册', '登录', '注册'])
+      if (!clicked) throw new Error('未找到登录按钮')
+
+      // 等待登录完成：出现 SUB Cookie 或页面跳转到 weibo.com
+      const deadline = Date.now() + 60000
+      let loggedIn = false
+      while (Date.now() < deadline) {
+        if (await isLoggedIn(page)) { loggedIn = true; break }
+        await wait(1000)
+      }
+      if (!loggedIn) {
+        const msg = await page.evaluate(() => {
+          const el = document.querySelector('.text-red, [class*="error"]')
+          return el?.innerText || ''
+        }).catch(() => '')
+        throw new Error(msg || '短信登录超时或验证码错误，请重试')
+      }
+    }
+
+    const cookies = await page.cookies()
+    const cookieString = buildCookieString(cookies)
+    closeSmsSession(state)
+
+    state.cookie = cookieString
+    state.cookies = cookies
+    await saveCookieRecord(ctx, state.cookie, state.cookies)
+    state.loginState = 'success'
+    state.loginMessage = '短信登录成功，Cookie 已保存'
+    state.lastCookieRefreshAt = Date.now()
+    await checkCookieValidity(ctx, config, state, { notify: false })
+    if (state.profile?.screenName) {
+      state.loginMessage = `短信登录成功，当前账号：${state.profile.screenName}`
+    }
+    logger.info('微博短信登录成功，Cookie 已保存到数据库。')
+    return { success: true, message: state.loginMessage }
+  } catch (error) {
+    closeSmsSession(state)
+    state.loginState = 'error'
+    state.loginMessage = '短信登录失败'
+    state.lastError = error.message || String(error)
+    throw error
+  }
+}
+
 async function renewCookieSilently(ctx, config, state) {
   if (!ctx.puppeteer) return
   if (!state.cookies.length) return
@@ -1114,6 +1403,7 @@ function clearCookieState(state) {
   state.qrImageDataUrl = null
   state.qrPollingTimer = null
   state.activeLoginPage = null
+  closeSmsSession(state)
 }
 
 /* --------------------------------- 主流程 --------------------------------- */
@@ -1203,6 +1493,7 @@ module.exports.apply = (ctx, config) => {
     qrPollingTimer: null,
     qrCaptureTask: null,
     activeLoginPage: null,
+    smsSession: null,
   }
 
   let ready = false
@@ -1250,6 +1541,30 @@ module.exports.apply = (ctx, config) => {
         updatedAt: Date.now(),
       }])
       koa.body = getLoginPanelState(ctx, config, state)
+    })
+
+    server.post(`${API_PREFIX}/sms/send`, async (koa) => {
+      const body = koa.request?.body || {}
+      const phone = String(body.phone ?? koa.query?.phone ?? '').trim()
+      try {
+        const result = await startSmsLogin(ctx, config, state, phone)
+        koa.body = { success: true, ...result, state: getLoginPanelState(ctx, config, state) }
+      } catch (error) {
+        koa.status = 400
+        koa.body = { success: false, error: error.message || String(error) }
+      }
+    })
+
+    server.post(`${API_PREFIX}/sms/login`, async (koa) => {
+      const body = koa.request?.body || {}
+      const code = String(body.code ?? koa.query?.code ?? '').trim()
+      try {
+        const result = await completeSmsLogin(ctx, config, state, code)
+        koa.body = { success: true, ...result, state: getLoginPanelState(ctx, config, state) }
+      } catch (error) {
+        koa.status = 400
+        koa.body = { success: false, error: error.message || String(error) }
+      }
     })
 
     serverRoutesRegistered = true
