@@ -23,6 +23,7 @@ GitHub 仓库：https://github.com/sxedward/sxedward-koishi-plugin-weibo-qq-broa
 
 - 定时拉取指定微博用户的最新动态，推送到多个群或频道。
 - 同时支持 `qq` 与 `qqguild`，可为每个订阅单独指定平台和机器人 ID。
+- 默认使用微博 PC 网页版 ajax 接口，可播报**粉丝可见微博**和**超话帖子**；并会自动展开长微博全文。
 - 使用数据库保存每个订阅的最后一条微博 MID，重启后不会重复推送。
 - 支持文本、原微博链接、图片下载后发送。
 - 支持关键词白名单、屏蔽词黑名单、跳过转发微博。
@@ -82,6 +83,24 @@ GitHub 仓库：https://github.com/sxedward/sxedward-koishi-plugin-weibo-qq-broa
 
 Cookie 状态判断使用 `https://m.weibo.cn/api/config`，以 `data.login === true` 且存在用户信息为有效依据。检测不到有效登录态时显示「已失效」。
 
+## 超话帖子与粉丝可见微博
+
+插件默认使用微博 PC 网页版的 `ajax/statuses/mymblog` 接口抓取（配置项 `apiMode: pc`）。相比旧的移动端接口，它能拿到受限博主的完整内容，是播报这两类微博的关键：
+
+- **超话帖子**：微博用户在超话内发的帖子同样出现在其时间线里，带 `region_name` 字段。插件会识别该字段并在播报标题上标注 `超话：#超话名#`。超话帖子通常是长文本，插件会自动拉取全文。
+- **粉丝可见微博**：前提条件是**扫码登录的微博账号必须是该博主的粉丝**。满足此条件时，PC 接口会返回完整正文并正常播报。若登录账号不是粉丝，微博只会返回「因用户隐私设置你看不到」的占位内容，插件会识别并跳过，不会播报错乱提示。
+- **长文本展开**：时间线接口给的 `text` 会被截断，插件默认按 MID 调用全文接口补全正文（移动端 `statuses/extend` 失败会自动回退到 PC 端 `statuses/longtext`）。可通过 `expandLongText: false` 关闭。
+
+如果没有扫码登录（或只手动填了不完整的 Cookie），PC 接口会返回 `ok=-100`，此时不会有任何播报。建议始终使用控制台扫码登录，保证 Cookie 完整且包含 `XSRF-TOKEN`。
+
+接口可用 `apiMode` 切换：
+
+| 值 | 说明 |
+| --- | --- |
+| `pc` | 默认值。仅用 PC 接口，能播报粉丝可见与超话长文，需要登录 Cookie。 |
+| `auto` | 先试 PC 接口，失败时自动回退到旧移动端接口。 |
+| `mobile` | 仅用旧移动端接口，不需要登录，但看不到粉丝可见微博和长文全文。 |
+
 ## 配置示例
 
 ```yaml
@@ -91,6 +110,8 @@ plugins:
     platform: qq
     selfId: ''
     updateInterval: 5
+    apiMode: pc
+    expandLongText: true
     cookieCheckInterval: 30
     expiryNotify: true
     expiryNotifyChannels: []
@@ -124,6 +145,8 @@ plugins:
 | `platform` | 默认平台，`qq` 或 `qqguild`。 |
 | `selfId` | 默认机器人 ID。留空则自动选择该平台下第一个在线 Bot。 |
 | `updateInterval` | 轮询间隔，单位分钟，范围 1 到 1440。 |
+| `apiMode` | 抓取接口：`pc`（默认，支持粉丝可见/超话长文，需登录）、`auto`（PC 失败回退移动端）、`mobile`（旧移动端接口）。 |
+| `expandLongText` | 是否自动展开长微博全文，默认开启。 |
 | `cookieCheckInterval` | Cookie 有效性检查间隔，单位分钟。 |
 | `expiryNotify` | Cookie 失效时是否发送通知。 |
 | `expiryNotifyChannels` | 失效通知目标。留空则通知所有订阅的群/频道。 |
